@@ -1,0 +1,2 @@
+example1|Soprano is an extremely lightweight text to speech model designed to produce highly realistic speech at unprecedented speed.
+example2|Gabagool? Ova here!
