@@ -6,3 +6,5 @@ torch
 torchaudio
 tqdm
 transformers
+datasets
+soundfile
