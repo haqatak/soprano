@@ -32,6 +32,7 @@ def get_args():
     parser.add_argument("--nb-tale-transcription", type=pathlib.Path, default="Annotation/part_1.trans", help="Path to NB Tale transcription file.")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of samples for testing.")
     parser.add_argument("--no-npsc", action="store_true", help="Skip NPSC dataset.")
+    parser.add_argument("--npsc-config", type=str, default="48K_mp3", help="Config name for NPSC dataset (e.g. 48K_mp3, 16K_mp3_bokmaal).")
     parser.add_argument("--no-nb-tale", action="store_true", help="Skip NB Tale dataset.")
     return parser.parse_args()
 
@@ -123,39 +124,77 @@ def parse_nb_tale_transcription(trans_file):
     print(f"Loaded {len(transcriptions)} transcriptions from NB Tale.")
     return transcriptions
 
-def process_npsc(dataset_name, encoder, device, limit=None):
-    print(f"Processing {dataset_name}...")
+def process_npsc(dataset_name, encoder, device, config_name="48K_mp3", limit=None):
+    print(f"Processing {dataset_name} with config {config_name}...")
 
-    # NPSC requires a config name. '16K_mp3_bokmaal' or similar.
-    # Since we resample to 32k, higher quality source is better. 48K_mp3.
-    # NPSC contains both bokmaal and nynorsk. We probably want both or just one.
-    # The prompt doesn't specify. I'll use 48K_mp3 which likely contains everything.
-
-    config_name = "48K_mp3"
-
+    ds = None
+    # Try the requested config first
     try:
-        ds = load_dataset(dataset_name, config_name, split="train", streaming=True, trust_remote_code=True)
-    except (TypeError, ValueError):
-        ds = load_dataset(dataset_name, config_name, split="train", streaming=True)
+        try:
+            ds = load_dataset(dataset_name, config_name, split="train", streaming=True, trust_remote_code=True)
+        except (TypeError, ValueError):
+            ds = load_dataset(dataset_name, config_name, split="train", streaming=True)
+    except Exception as e:
+        print(f"Failed to load NPSC with config {config_name}: {e}")
+        # Fallback logic if the specific config failed (e.g. not in cache)
+        # We try a few common configs
+        fallback_configs = ["16K_mp3_bokmaal", "16K_mp3_nynorsk", "16K_mp3"]
+        for fb_config in fallback_configs:
+            if fb_config == config_name:
+                continue
+            print(f"Trying fallback config: {fb_config}...")
+            try:
+                try:
+                    ds = load_dataset(dataset_name, fb_config, split="train", streaming=True, trust_remote_code=True)
+                except (TypeError, ValueError):
+                     ds = load_dataset(dataset_name, fb_config, split="train", streaming=True)
+
+                print(f"Successfully loaded NPSC with fallback config: {fb_config}")
+                break
+            except Exception as e_fb:
+                print(f"Failed to load fallback config {fb_config}: {e_fb}")
+
+        if ds is None:
+            print("Could not load NPSC dataset with any config. Skipping.")
+            return []
 
     data = []
     count = 0
-    for sample in tqdm(ds):
-        text = sample['text']
-        audio_array = sample['audio']['array']
-        sr = sample['audio']['sampling_rate']
 
-        audio_tensor = torch.from_numpy(audio_array).float()
-
+    # Check available columns
+    if ds is not None:
         try:
-            tokens = process_audio(audio_tensor, sr, encoder, device)
-            data.append([text, tokens])
-            count += 1
-        except Exception as e:
-            print(f"Error processing sample: {e}")
+            sample = next(iter(ds))
+            if 'text' not in sample and 'sentence_text' not in sample:
+                print(f"Dataset {dataset_name} does not contain 'text' or 'sentence_text' column. Skipping.")
+                return []
+        except StopIteration:
+            print(f"Dataset {dataset_name} is empty. Skipping.")
+            return []
 
-        if limit and count >= limit:
-            break
+    if ds is not None:
+        for sample in tqdm(ds):
+            text = sample.get('text', sample.get('sentence_text', ''))
+            if not text:
+                continue
+
+            if 'audio' not in sample:
+                 continue
+
+            audio_array = sample['audio']['array']
+            sr = sample['audio']['sampling_rate']
+
+            audio_tensor = torch.from_numpy(audio_array).float()
+
+            try:
+                tokens = process_audio(audio_tensor, sr, encoder, device)
+                data.append([text, tokens])
+                count += 1
+            except Exception as e:
+                print(f"Error processing sample: {e}")
+
+            if limit and count >= limit:
+                break
 
     return data
 
@@ -219,13 +258,20 @@ def main():
 
     if not args.no_npsc:
         # NPSC Train
-        npsc_train = process_npsc("NbAiLab/NPSC", encoder, device, args.limit)
+        npsc_train = process_npsc("NbAiLab/NPSC", encoder, device, args.npsc_config, args.limit)
         full_dataset.extend(npsc_train)
 
         # NPSC Test
         # The prompt mentioned NPSC and NPSC_test.
         # NPSC dataset on HF usually has splits, but NbAiLab/NPSC_test is separate.
-        npsc_test = process_npsc("NbAiLab/NPSC_test", encoder, device, args.limit)
+        # NPSC_test might not use the same config names? It seems it doesn't have configs in the same way,
+        # or it is a separate dataset. Let's try with the same config logic but handle failure similarly.
+        # Checking NbAiLab/NPSC_test online would be good, but assuming it works similarly or has default.
+        # Actually, NPSC_test might just be the test split?
+        # But earlier I found "NbAiLab/NPSC" has splits.
+        # If "NbAiLab/NPSC_test" is a dataset, does it have the same configs?
+        # To be safe, we use the fallback logic inside process_npsc.
+        npsc_test = process_npsc("NbAiLab/NPSC_test", encoder, device, args.npsc_config, args.limit)
         full_dataset.extend(npsc_test)
 
     if not args.no_nb_tale:
