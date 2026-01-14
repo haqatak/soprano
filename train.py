@@ -40,7 +40,12 @@ def get_args():
 args = get_args()
 
 # training hyperparameters
-device = 'cuda:0'
+if torch.cuda.is_available():
+    device = 'cuda:0'
+elif torch.backends.mps.is_available():
+    device = 'mps'
+else:
+    device = 'cpu'
 seed = 1337
 max_lr = 5e-4
 warmup_ratio = 0.1
@@ -119,7 +124,7 @@ def evaluate(val_dataloader):
         for _ in range(val_loss_steps):
             x, y = next(val_dataloader_it)
             x, y = x.to(device), y.to(device)
-            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            with torch.autocast(device_type=device_type, dtype=autocast_dtype):
                 logits = model(x).logits
                 audio_loss, text_loss, acc = compute_loss(logits, y, val_loss_steps)
             val_audio_loss_accum += audio_loss.detach()
@@ -131,11 +136,20 @@ def evaluate(val_dataloader):
 
 tokenizer = AutoTokenizer.from_pretrained('ekwek/Soprano-80M')
 if __name__ == '__main__':
-    device_type = "cuda" if device.startswith("cuda") else "cpu"
+    if device.startswith("cuda"):
+        device_type = "cuda"
+        autocast_dtype = torch.bfloat16
+    elif device == "mps":
+        device_type = "mps"
+        autocast_dtype = torch.float16
+    else:
+        device_type = "cpu"
+        autocast_dtype = torch.bfloat16
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
     torch.set_float32_matmul_precision('high')
+    print(f"Device: {device}")
     print(f"Save Path: {save_path}")
 
     # lr schedule
@@ -144,7 +158,10 @@ if __name__ == '__main__':
 
     # model
     model = AutoModelForCausalLM.from_pretrained('ekwek/Soprano-80M')
-    model.to(torch.bfloat16).to(device)
+    if device_type == "mps":
+        model.to(torch.float32).to(device)
+    else:
+        model.to(torch.bfloat16).to(device)
     model.train()
 
     # dataset
@@ -172,7 +189,8 @@ if __name__ == '__main__':
     )
 
     # optimizer
-    opt = torch.optim.AdamW(model.parameters(), max_lr, betas=betas, weight_decay=weight_decay, fused=True)
+    use_fused = device_type == "cuda"
+    opt = torch.optim.AdamW(model.parameters(), max_lr, betas=betas, weight_decay=weight_decay, fused=use_fused)
 
     pbar = tqdm(range(0, max_steps), ncols=200, dynamic_ncols=True)
     for step in pbar:
@@ -192,7 +210,7 @@ if __name__ == '__main__':
                 x, y = next(dataloader_it)
             x, y = x.to(device), y.to(device)
 
-            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            with torch.autocast(device_type=device_type, dtype=autocast_dtype):
                 logits = model(x).logits
                 audio_loss, text_loss, acc = compute_loss(logits, y, grad_accum_steps)
             audio_loss_accum += audio_loss.detach()
@@ -206,7 +224,8 @@ if __name__ == '__main__':
         for param_group in opt.param_groups:
             param_group['lr'] = lr
         opt.step()
-        torch.cuda.synchronize()
+        if device_type == "cuda":
+            torch.cuda.synchronize()
         total_tokens = step * batch_size*seq_len*grad_accum_steps
         end = time.time()
         dt = (end-start)*1000
